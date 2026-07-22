@@ -31,9 +31,6 @@ flutter:
         pluginClass: DesktopDropPlugin
       windows:
         pluginClass: DesktopDropPlugin
-      android:
-        package: one.mixin.desktop.drop
-        pluginClass: DesktopDropPlugin
       web:
         pluginClass: DesktopDropWeb
         fileName: desktop_drop_web.dart
