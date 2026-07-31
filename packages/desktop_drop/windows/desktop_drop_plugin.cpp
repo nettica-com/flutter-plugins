@@ -1,6 +1,7 @@
 #include "include/desktop_drop/desktop_drop_plugin.h"
 
 #include <windows.h>
+#include <shlobj.h>
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
@@ -100,10 +101,19 @@ namespace {
         virtual ~DesktopDropTarget();
 
     private:
+        // Narrows |pdwEffect| to the effect this target performs (a copy), or
+        // DROPEFFECT_NONE when the drag carries no files. Windows picks the drag
+        // cursor from this value, so leaving it untouched shows the wrong icon.
+        void ApplyDropEffect(DWORD *pdwEffect) const;
+
         FlutterMethodChannel channel_;
         HWND window_handle_;
         LONG ref_count_;
         bool need_revoke_ole_initialize_;
+        bool can_accept_drop_;
+        // Renders the shell's drag image (file thumbnail and "Copy to ..." label).
+        // Without it the shell falls back to a dotted outline rectangle.
+        IDropTargetHelper *drop_target_helper_;
     };
 
     class DesktopDropPlugin : public flutter::Plugin {
@@ -161,7 +171,10 @@ namespace {
 
 
     DesktopDropTarget::DesktopDropTarget(FlutterMethodChannel channel, HWND window_handle) : channel_(
-            std::move(channel)), window_handle_(window_handle), ref_count_(0), need_revoke_ole_initialize_(false) {
+            std::move(channel)), window_handle_(window_handle), ref_count_(0), need_revoke_ole_initialize_(false),
+                                                                                             can_accept_drop_(false),
+                                                                                             drop_target_helper_(
+                                                                                                     nullptr) {
         auto ret = RegisterDragDrop(window_handle_, this);
         if (ret == E_OUTOFMEMORY) {
             OleInitialize(nullptr);
@@ -174,10 +187,35 @@ namespace {
         if (ret != 0) {
             std::cout << "RegisterDragDrop failed: " << ret << std::endl;
         }
+
+        // Optional: the drop still works when the helper is unavailable, we just
+        // lose the drag image.
+        CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                         IID_PPV_ARGS(&drop_target_helper_));
+    }
+
+    void DesktopDropTarget::ApplyDropEffect(DWORD *pdwEffect) const {
+        if (pdwEffect == nullptr) {
+            return;
+        }
+        // |*pdwEffect| arrives as the set of effects the source allows. Prefer a
+        // copy, and fall back to whatever single effect remains available.
+        if (!can_accept_drop_) {
+            *pdwEffect = DROPEFFECT_NONE;
+        } else *pdwEffect = DROPEFFECT_COPY;
     }
 
     HRESULT DesktopDropTarget::DragEnter(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {
+        FORMATETC fmtetc = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        can_accept_drop_ = pDataObj != nullptr && pDataObj->QueryGetData(&fmtetc) == S_OK;
+        ApplyDropEffect(pdwEffect);
+
         POINT point = {pt.x, pt.y};
+        if (drop_target_helper_ != nullptr) {
+            POINT screen_point = point;
+            drop_target_helper_->DragEnter(window_handle_, pDataObj, &screen_point,
+                                           pdwEffect == nullptr ? DROPEFFECT_NONE : *pdwEffect);
+        }
         ScreenToClient(window_handle_, &point);
         channel_->InvokeMethod("entered", std::make_unique<flutter::EncodableValue>(
                 flutter::EncodableList{
@@ -185,11 +223,17 @@ namespace {
                         flutter::EncodableValue(double(point.y))
                 }
         ));
-        return 0;
+        return S_OK;
     }
 
     HRESULT DesktopDropTarget::DragOver(DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {
+        ApplyDropEffect(pdwEffect);
+
         POINT point = {pt.x, pt.y};
+        if (drop_target_helper_ != nullptr) {
+            POINT screen_point = point;
+            drop_target_helper_->DragOver(&screen_point, pdwEffect == nullptr ? DROPEFFECT_NONE : *pdwEffect);
+        }
         ScreenToClient(window_handle_, &point);
         channel_->InvokeMethod("updated", std::make_unique<flutter::EncodableValue>(
                 flutter::EncodableList{
@@ -197,12 +241,16 @@ namespace {
                         flutter::EncodableValue(double(point.y))
                 }
         ));
-        return 0;
+        return S_OK;
     }
 
     HRESULT DesktopDropTarget::DragLeave() {
+        if (drop_target_helper_ != nullptr) {
+            drop_target_helper_->DragLeave();
+        }
+        can_accept_drop_ = false;
         channel_->InvokeMethod("exited", std::make_unique<flutter::EncodableValue>());
-        return 0;
+        return S_OK;
     }
 
     HRESULT DesktopDropTarget::Drop(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {
@@ -213,8 +261,19 @@ namespace {
         FORMATETC fmtetc = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
         STGMEDIUM stgmed;
 
+        can_accept_drop_ = pDataObj != nullptr && pDataObj->QueryGetData(&fmtetc) == S_OK;
+        // Report the effect actually performed, so the source doesn't treat the
+        // drop as a move or a link.
+        ApplyDropEffect(pdwEffect);
+
+        if (drop_target_helper_ != nullptr) {
+            POINT screen_point = {pt.x, pt.y};
+            drop_target_helper_->Drop(pDataObj, &screen_point,
+                                      pdwEffect == nullptr ? DROPEFFECT_NONE : *pdwEffect);
+        }
+
         // See if the dataobject contains any TEXT stored as a HGLOBAL
-        if (pDataObj->QueryGetData(&fmtetc) == S_OK) {
+        if (can_accept_drop_) {
             // Yippie! the data is there, so go get it!
             if (pDataObj->GetData(&fmtetc, &stgmed) == S_OK) {
                 // we asked for the data as a HGLOBAL, so access it appropriately
@@ -238,7 +297,8 @@ namespace {
         }
         channel_->InvokeMethod("performOperation", std::make_unique<flutter::EncodableValue>(list));
 
-        return 0;
+        can_accept_drop_ = false;
+        return S_OK;
     }
 
     HRESULT DesktopDropTarget::QueryInterface(const IID &iid, void **ppvObject) {
@@ -268,6 +328,10 @@ namespace {
     }
 
     DesktopDropTarget::~DesktopDropTarget() {
+        if (drop_target_helper_ != nullptr) {
+            drop_target_helper_->Release();
+            drop_target_helper_ = nullptr;
+        }
         RevokeDragDrop(window_handle_);
         if (need_revoke_ole_initialize_) {
             OleUninitialize();
